@@ -1,0 +1,15 @@
+[package]
+name = "cup_disk_ratio_api"
+version = "0.1.0"
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "cup_disk_ratio_api"
+crate-type = ["cdylib"]
+
+[dependencies]
+ndarray = "0.17.2"
+opencv = "0.98.2"
+pyo3 = "0.28.2"
+
