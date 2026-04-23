@@ -1,33 +1,105 @@
 use std::ffi::c_void;
-use ndarray::{ArrayBase,
-    OwnedRepr,
-    prelude::*};
+use ndarray::{prelude::*};
 use opencv::{
-    boxed_ref::BoxedRef, core::{CV_8U, Mat, Mat_AUTO_STEP, ToInputArray, ToOutputArray}, imgcodecs, prelude::*
+    boxed_ref::BoxedRef, 
+    imgproc,    
+    core::{CV_8U, CV_8UC3, Vec3b, Mat, Mat_AUTO_STEP, split, Vector, AlgorithmHint}, 
+    imgcodecs, prelude::*
 };
 
-fn array_to_mat (array: &Array2<u8>) -> Mat {
-    let mut standard_layout = array.as_standard_layout();
-    let slice = standard_layout.as_slice().unwrap();
-    let (height, width) = array.dim();
-    
-    let mat = unsafe {
-        Mat::new_rows_cols_with_data(height as i32, 
-            width as i32, 
-            slice,
-        )
-    };
-    mat.unwrap().clone_pointee()
+enum ArrayInput<'a> {
+    TwoDim(&'a Array2<u8>),
+    ThreeDim(&'a Array3<u8>)
 }
 
-// pub fn dyalic_gaussian_pyramid(image: &Array2<u8>,
-//                                 scale: usize) -> Vec<Array2<u8>> {
-//     let mut pyramid_images = Vec::with_capacity(scale);
-    
-//     let mut clone_image = ndarray_to
+enum ImageFormat {
+    BGR,
+    HSV
+}
+
+struct ImageChannels {
+    image_format: ImageFormat,
+    first_channel: Mat,
+    second_channel: Mat,
+    third_channel: Mat
+}
+
+impl ImageChannels {
+    fn split_channel(image_mat: &Mat, image_format: ImageFormat) -> opencv::Result<Self> {
+        let mut channels = Vector::<Mat>::new();
+        split(image_mat, &mut channels);
+
+        Ok(
+            ImageChannels { 
+                 image_format: image_format,
+                 first_channel: channels.get(0).unwrap(),
+                 second_channel: channels.get(1).unwrap(),
+                 third_channel: channels.get(2).unwrap()
+                }
+        )
+    }
+}
+
+fn array_to_mat<'a> (array: ArrayInput) -> opencv::Result<Mat> {
+    match array {
+        ArrayInput::TwoDim(arr) => {
+            let mut standard_layout = arr.as_standard_layout();
+            let slice = standard_layout.as_slice().unwrap();
+            let (height, width) = arr.dim();
+            
+            let mat = unsafe {
+                Mat::new_rows_cols_with_data(
+                    height as i32, 
+                    width as i32, 
+                    slice,
+                )?
+            }.clone_pointee();
+            
+            Ok(mat)
+        }
+        ArrayInput::ThreeDim(arr) => {
+            let (height, width, channels) = arr.dim();
+            if channels != 3 {
+                return Err(opencv::Error::new(
+                    opencv::core::StsBadArg,
+                    "Array set to ThreeDim but channel is not 3",
+                ));
+
+            }
+            let slice  = arr.as_slice().ok_or_else(|| opencv::Error::new(opencv::core::StsBadArg,
+                                                            "Image is not contigous"))?;
+            let mat= unsafe {
+                Mat::new_rows_cols_with_data_unsafe(
+                    height as i32, 
+                    width as i32, 
+                    CV_8UC3, 
+                    slice.as_ptr() as *mut c_void, 
+                    Mat_AUTO_STEP)?
+                    .into()
+            };
+            Ok(mat)
+        }
+    }
+}
+
+
+pub fn feature_extraction (image_mat: Mat) {
+    let height = image_mat.rows();
+    let width = image_mat.cols();
+    // Convert BGR to HSV
+    let mut hsv_format = Mat::default();
+    imgproc::cvt_color(&image_mat,
+        &mut hsv_format, 
+        imgproc::COLOR_BGR2HSV, 
+        0,
+        AlgorithmHint::ALGO_HINT_DEFAULT);
+
+    // Split channels 
+    let bgr = ImageChannels::split_channel(&image_mat, ImageFormat::BGR).unwrap();
+    let hsv = ImageChannels::split_channel(&hsv_format, ImageFormat::HSV).unwrap();
     
 
-// }
+}   
 
 fn main () {
 
@@ -39,14 +111,14 @@ mod test {
     use ndarray::array;
 
     #[test]
-    fn  test_array_dimension() {
+    fn  test_array_2_d_dimension() {
         let array= array![
             [10u8, 20u8, 30u8],
             [40u8, 50u8, 60u8],
             [70u8, 80u8, 90u8]
         ];
 
-        let mat = array_to_mat(&array);
+        let mat = array_to_mat(ArrayInput::TwoDim(&array)).unwrap();
         assert_eq!(mat.rows(), 3);
         assert_eq!(mat.cols(), 3);
 
@@ -57,5 +129,35 @@ mod test {
         assert_eq!(*mat.at_2d::<u8>(1, 0).unwrap(), 40u8);
         assert_eq!(*mat.at_2d::<u8>(1, 1).unwrap(), 50u8);
         assert_eq!(*mat.at_2d::<u8>(1, 2).unwrap(), 60u8);
+    }
+
+    #[test]
+    fn test_array_3_d_dimension () {
+        let array = array![
+            [[10u8, 20u8, 30u8], [1u8, 2u8, 3u8]],
+            [[40u8, 50u8, 60u8], [4u8, 5u8, 6u8]]
+        ];
+        let mat = array_to_mat(ArrayInput::ThreeDim(&array)).unwrap();
+        let pixel_00 = mat.at_2d::<Vec3b>(0, 0).unwrap();
+        let pixel_01= mat.at_2d::<Vec3b>(0, 1).unwrap();
+        let pixel_10 = mat.at_2d::<Vec3b>(1, 0).unwrap();
+        assert_eq!(mat.rows(), 2);
+        assert_eq!(mat.cols(), 2);
+        assert_eq!(mat.channels(), 3);
+
+        assert_eq!(pixel_00[0], 10u8);
+        assert_eq!(pixel_00[1], 20u8);
+        assert_eq!(pixel_00[2], 30u8);
+
+        assert_eq!(pixel_01[0], 1u8);
+        assert_eq!(pixel_01[1], 2u8);
+        assert_eq!(pixel_01[2], 3u8);
+
+        assert_eq!(pixel_10[0], 40u8);
+        assert_eq!(pixel_10[1], 50u8);
+        assert_eq!(pixel_10[2], 60u8);
+
+
+
     }
 }
