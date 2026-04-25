@@ -1,11 +1,14 @@
 use std::ffi::c_void;
+use std::sync::atomic::{Ordering};
 use ndarray::{prelude::*};
 use opencv::{
-    boxed_ref::BoxedRef, 
     imgproc,    
-    core::{CV_8U, CV_8UC3, Vec3b, Mat, Mat_AUTO_STEP, split, Vector, AlgorithmHint}, 
-    imgcodecs, prelude::*
+    core::{ CV_8UC3, Mat, Mat_AUTO_STEP, split, Size, Vector, AlgorithmHint}, 
+    prelude::*
 };
+use fast_slic_rust::arrays::LABImage;
+use fast_slic_rust::common::Config;
+use fast_slic_rust::slic::{iterate, Clusters};
 
 enum ArrayInput<'a> {
     TwoDim(&'a Array2<u8>),
@@ -40,6 +43,16 @@ impl ImageChannels {
     }
 }
 
+#[allow(dead_code)]
+fn apply_histogram_equalization(image_mat: &Mat) -> opencv::Result<Mat> {
+    let mut clahe = imgproc::create_clahe(3.0, 
+                                                    Size::new(8, 8)).unwrap();
+    let mut dst = Mat::default();
+    clahe.apply(image_mat, &mut dst)?;
+    Ok(dst)
+}
+
+#[allow(dead_code)]
 fn array_to_mat<'a> (array: ArrayInput) -> opencv::Result<Mat> {
     match array {
         ArrayInput::TwoDim(arr) => {
@@ -83,7 +96,7 @@ fn array_to_mat<'a> (array: ArrayInput) -> opencv::Result<Mat> {
 }
 
 
-pub fn feature_extraction (image_mat: Mat) {
+pub fn feature_extraction (image_mat: Mat, n_segments: i32, compactness: i32) {
     let height = image_mat.rows();
     let width = image_mat.cols();
     // Convert BGR to HSV
@@ -98,7 +111,33 @@ pub fn feature_extraction (image_mat: Mat) {
     let bgr = ImageChannels::split_channel(&image_mat, ImageFormat::BGR).unwrap();
     let hsv = ImageChannels::split_channel(&hsv_format, ImageFormat::HSV).unwrap();
     
+    // Convert image_mat from Mat to &[u8] and LABImage for fast SLIC
+    let mut rgb_image_mat = Mat::default();
+    imgproc::cvt_color(&image_mat, 
+                        &mut rgb_image_mat, 
+                        imgproc::COLOR_BGR2RGB, 
+                        0, 
+                        AlgorithmHint::ALGO_HINT_DEFAULT);
+    let data_byte: &[u8] = rgb_image_mat.data_bytes().unwrap();
+    let lab_image = LABImage::from_srgb(data_byte, 
+                                                 width as usize, 
+                                                 height as usize);
+    // Set up config value
+    let mut config = Config::default();
+    config.num_of_clusters = n_segments as u16;
+    config.compactness = compactness as f32;
 
+    let mut cluster = Clusters::initialize_clusters(&lab_image, &config);
+    iterate(&lab_image, &config, &mut cluster);
+    
+    // Get the label
+    let slic_label: Vec<u16> = cluster.assignments
+                        .data
+                        .iter()
+                        .map(|x| x.load(Ordering::Relaxed))
+                        .collect();
+
+    
 }   
 
 fn main () {
@@ -109,6 +148,7 @@ fn main () {
 mod test {
     use  super::*;
     use ndarray::array;
+    use opencv::core::Vec3b;
 
     #[test]
     fn  test_array_2_d_dimension() {
