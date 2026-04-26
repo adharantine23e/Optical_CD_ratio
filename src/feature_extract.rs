@@ -1,9 +1,10 @@
 use std::ffi::c_void;
+use std::collections::HashMap;
 use std::sync::atomic::{Ordering};
 use ndarray::{prelude::*};
 use opencv::{
     imgproc,    
-    core::{ CV_8UC3, Mat, Mat_AUTO_STEP, split, Size, Vector, AlgorithmHint}, 
+    core::{ CV_8UC3, CV_8UC1, Mat, Mat_AUTO_STEP, split, Size, Vector, AlgorithmHint, bitwise_and}, 
     prelude::*
 };
 use fast_slic_rust::arrays::LABImage;
@@ -50,6 +51,72 @@ fn apply_histogram_equalization(image_mat: &Mat) -> opencv::Result<Mat> {
     let mut dst = Mat::default();
     clahe.apply(image_mat, &mut dst)?;
     Ok(dst)
+}
+
+#[allow(dead_code)]
+fn calculate_histogram(image_mat: &Mat, mask: &Mat) -> opencv::Result<Mat> {
+    let mut hist = Mat::default();
+    let channels: Vector<i32> = Vector::from(vec![0]);
+    let hist_size: Vector<i32> = Vector::from(vec![256]);
+    let ranges: Vector<f32> = Vector::from(vec![0.0, 256.0]);
+
+    imgproc::calc_hist(image_mat, 
+                         &channels, 
+                         mask, 
+                         &mut hist, 
+                         &hist_size, 
+                         &ranges,
+                        false);
+    Ok(hist)
+}
+
+#[allow(dead_code)]
+fn segment_hist_calculation(slic_segments: Mat, image_chosen: Mat) -> Result<Vec<Vec<f32>>, opencv::Error> {
+    if slic_segments.rows() != image_chosen.rows() || slic_segments.cols() != image_chosen.cols() {
+        return Err(opencv::Error::new(opencv::core::StsBadArg, 
+                                        "Mismatch shape between slic_segments and image_chosen"));
+    } else {
+        let rows = slic_segments.rows();
+        let cols = slic_segments.cols();
+        let mut histogram_value: Vec<Vec<f32>> = Vec::new();
+        let mut slic_unique_segments = HashMap::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                let segment_id = *slic_segments.at_2d::<u8>(row, col).unwrap();
+                *slic_unique_segments.entry(segment_id).or_insert(0) += 1;
+            }
+        }
+
+        for (_, (seg_val, _))in slic_unique_segments.iter().enumerate() {
+            let mut zero_mat = Mat::zeros(rows, cols, CV_8UC1).unwrap().to_mat().unwrap();
+            for row in 0..rows {
+                for col in 0..cols {
+                    let segment_id = *slic_segments.at_2d::<u8>(row, col).unwrap();
+                    if segment_id == *seg_val {
+                        *zero_mat.at_2d_mut::<u8>(row, col).unwrap() = 255;
+                        
+                        // Get the segment area based on the mask
+                        let mut masked_image = Mat::default();
+                        bitwise_and(&image_chosen,
+                                     &image_chosen, 
+                                     &mut masked_image,
+                                    &zero_mat).unwrap();
+                        let equalized_masked_image = apply_histogram_equalization(&masked_image).unwrap();
+                        let hist_segment = calculate_histogram(&equalized_masked_image, 
+                                                                    &Mat::default()).unwrap()
+                                                                                        .reshape(0, 1)
+                                                                                        .unwrap()
+                                                                                        .clone_pointee();                                            
+                        
+                        histogram_value.push(hist_segment.data_typed::<f32>().unwrap().to_vec());
+                    }
+                }
+            }
+
+        }
+
+        Ok(histogram_value)
+    }
 }
 
 #[allow(dead_code)]
@@ -131,13 +198,23 @@ pub fn feature_extraction (image_mat: Mat, n_segments: i32, compactness: i32) {
     iterate(&lab_image, &config, &mut cluster);
     
     // Get the label
-    let slic_label: Vec<u16> = cluster.assignments
+    let slic_label: Vec<u8> = cluster.assignments
                         .data
                         .iter()
                         .map(|x| x.load(Ordering::Relaxed))
+                        .map(|x| x as u8)
                         .collect();
 
-    
+    let slic_label_mat = unsafe {
+                Mat::new_rows_cols_with_data(
+                    height as i32, 
+                    width as i32, 
+                    slic_label.as_slice(),
+        ).unwrap()
+    }.clone_pointee();
+
+
+
 }   
 
 fn main () {
