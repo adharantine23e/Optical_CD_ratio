@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::atomic::{Ordering};
-use ndarray::{prelude::*};
+use ndarray::{concatenate, prelude::*};
 use opencv::{
     imgproc,    
     core::{ CV_8UC3, CV_8UC1, Mat, Mat_AUTO_STEP, split, Size, Vector, AlgorithmHint, bitwise_and}, 
@@ -71,7 +71,7 @@ fn calculate_histogram(image_mat: &Mat, mask: &Mat) -> opencv::Result<Mat> {
 }
 
 #[allow(dead_code)]
-fn segment_hist_calculation(slic_segments: Mat, image_chosen: Mat) -> Result<Vec<Vec<f32>>, opencv::Error> {
+fn segment_hist_calculation(slic_segments: Mat, image_chosen: Mat) -> Result<Array2<f32>, opencv::Error> {
     if slic_segments.rows() != image_chosen.rows() || slic_segments.cols() != image_chosen.cols() {
         return Err(opencv::Error::new(opencv::core::StsBadArg, 
                                         "Mismatch shape between slic_segments and image_chosen"));
@@ -114,8 +114,10 @@ fn segment_hist_calculation(slic_segments: Mat, image_chosen: Mat) -> Result<Vec
             }
 
         }
-
-        Ok(histogram_value)
+        
+        let histogram_value_array = Array2::from_shape_vec((histogram_value.len(), histogram_value[0].len()), 
+                                                                                                        histogram_value.into_iter().flatten().collect()).unwrap();
+        Ok(histogram_value_array)
     }
 }
 
@@ -213,7 +215,19 @@ pub fn feature_extraction (image_mat: Mat, n_segments: i32, compactness: i32) {
         ).unwrap()
     }.clone_pointee();
 
+    // Get the histogram value for each segment
+    let blue_hist = segment_hist_calculation(slic_label_mat.clone(),
+                                                            bgr.first_channel.clone()).unwrap();
+    let green_hist = segment_hist_calculation(slic_label_mat.clone(),
+                                                            bgr.second_channel.clone()).unwrap();
+    let hue_hist = segment_hist_calculation(slic_label_mat.clone(),
+                                                            hsv.first_channel.clone()).unwrap();
+    let saturation_hist = segment_hist_calculation(slic_label_mat.clone(),
+                                                            hsv.second_channel.clone()).unwrap();
 
+    //  Concatenate the histogram values to get the feature vector the shape should be (n_segments, 256 * 4)
+    let ceh_features = concatenate(Axis((1)),
+                                                                             &[blue_hist.view(), green_hist.view(), hue_hist.view(), saturation_hist.view()]).unwrap();
 
 }   
 
@@ -225,7 +239,23 @@ fn main () {
 mod test {
     use  super::*;
     use ndarray::array;
-    use opencv::core::Vec3b;
+    use opencv::core::{Vec3b, Vector};
+    use opencv::{imgcodecs, imgproc};
+    use fast_slic_rust::arrays::LABImage;
+    use fast_slic_rust::common::Config;
+    use fast_slic_rust::slic::{iterate, Clusters};
+    
+    #[test]
+    fn vec_concat_1d () {
+        use ndarray::Array2;
+
+        let a : Vec<Vec<u8>> = vec![ vec![1, 2, 3], vec![2, 4, 6]];
+        let a_array = Array2::from_shape_vec((a.len(), a[0].len()), 
+                                                                                    a.into_iter().flatten().collect()).unwrap();
+        
+        assert_eq!(a_array.get((0, 1)).unwrap(), &2u8);
+
+    }
 
     #[test]
     fn  test_array_2_d_dimension() {
@@ -273,8 +303,64 @@ mod test {
         assert_eq!(pixel_10[0], 40u8);
         assert_eq!(pixel_10[1], 50u8);
         assert_eq!(pixel_10[2], 60u8);
+    }
+
+    #[test]
+    fn test_fast_slic() {
+        let img = imgcodecs::imread("reference_image/CTEH-003617.jpg.png",
+                                    imgcodecs::IMREAD_COLOR).unwrap();
+        let width = img.cols();
+        let height = img.rows();
+        let n_segments = 100;
+        let compactness = 10;
+        let mut rgb_image_mat = Mat::default();
+        imgproc::cvt_color(&img, 
+                            &mut rgb_image_mat, 
+                            imgproc::COLOR_BGR2RGB, 
+                            0, 
+                            AlgorithmHint::ALGO_HINT_DEFAULT);
+        let data_byte: &[u8] = rgb_image_mat.data_bytes().unwrap();
+        let lab_image = LABImage::from_srgb(data_byte, 
+                                                    width as usize, 
+                                                    height as usize);
+        let mut params =  Vector::default();
+        params.push(imgcodecs::IMWRITE_JPEG_QUALITY);
+        params.push(95);
+
+        // Set up config value
+        let mut config = Config::default();
+        config.num_of_clusters = n_segments as u16;
+        config.compactness = compactness as f32;
+
+        let mut cluster = Clusters::initialize_clusters(&lab_image, &config);
+        iterate(&lab_image, &config, &mut cluster);
+
+        // Get the label
+        let slic_label: Vec<u8> = cluster.assignments
+                            .data
+                            .iter()
+                            .map(|x| x.load(Ordering::Relaxed))
+                            .map(|x| x as u8)
+                            .collect();
+        
+        let max_label = *slic_label.iter().max().unwrap() as f32;
+        println!("Max label value: {}", max_label);
+        let slic_label_normalized: Vec<u8> = slic_label.iter()
+                                            .map(|&x| (x as f32 * (255.0 / max_label)) as u8)
+                                            .collect();
+
+        let slic_label_mat = unsafe {
+                    Mat::new_rows_cols_with_data(
+                        height as i32, 
+                        width as i32, 
+                        slic_label_normalized.as_slice(),
+            ).unwrap()
+        }.clone_pointee();
 
 
+        imgcodecs::imwrite("fast_slic_output.png",
+                            &slic_label_mat,
+                            &params).unwrap();
 
     }
 }
