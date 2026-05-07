@@ -2,9 +2,10 @@ use std::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::atomic::{Ordering};
 use ndarray::{concatenate, prelude::*};
+use opencv::core::{CV_16FC1, CV_64FC1, Point, Size_};
 use opencv::{
     imgproc,    
-    core::{ CV_8UC3, CV_8UC1, Mat, Mat_AUTO_STEP, split, Size, Vector, AlgorithmHint, bitwise_and}, 
+    core::{ CV_8UC3, CV_8UC1, Mat, Mat_AUTO_STEP, split, Size, BORDER_DEFAULT, Vector, AlgorithmHint, bitwise_and, subtract, no_array, find_non_zero}, 
     prelude::*
 };
 use fast_slic_rust::arrays::LABImage;
@@ -122,6 +123,98 @@ fn segment_hist_calculation(slic_segments: Mat, image_chosen: Mat) -> Result<Arr
 }
 
 #[allow(dead_code)]
+fn dyalic_gaussian_pyramid(image_chosen: Mat) -> Result<Vec<Mat>, opencv::Error> {
+    let scale: u8 = 9;
+    let mut pyramids: Vec<Mat> = Vec::new();
+    let mut image = image_chosen.clone();
+    for i in 0..scale {
+        pyramids.push(image.clone());
+        if i < scale - 1 {
+            let mut dst = Mat::default();
+            imgproc::pyr_down(&image,
+                                &mut dst, 
+                                Size::default(), 
+                                BORDER_DEFAULT).unwrap();
+            image = dst;
+        }
+    }
+
+    Ok(pyramids)
+}
+
+#[allow(dead_code)]
+fn combine_dgp_map(finer_map: &Mat, coaser_map: &Mat, height: i32, width: i32) -> Result<Mat, opencv::Error> {
+    let finer_map_height = finer_map.rows();
+    let finer_map_width = finer_map.cols();
+
+    let mut coaser_dst = Mat::default();
+    imgproc::resize(coaser_map, 
+                    &mut coaser_dst, 
+                    Size::new(finer_map_width, finer_map_height), 
+                    0.0,
+                    0.0, 
+                    imgproc::INTER_CUBIC).unwrap();
+    
+    let mut finer_map_float = Mat::default();
+    let mut coarser_map_float = Mat::default();
+
+    finer_map.convert_to(&mut finer_map_float,
+        CV_64FC1, 
+        1.0, 
+        0.0);
+    
+    coaser_map.convert_to(&mut coarser_map_float,
+        CV_64FC1, 
+        1.0, 
+        0.0);
+    
+    // Compute center-surround difference: finer - interpolated coarser
+    let mut centre_surr_diff = Mat::default();
+    subtract(&finer_map_float, 
+            &coarser_map_float, 
+            &mut centre_surr_diff, 
+            &no_array(), 
+            CV_16FC1).unwrap();
+
+    let mut centre_surr_diff_dst = Mat::default();
+    imgproc::resize(&centre_surr_diff, 
+        &mut centre_surr_diff_dst, 
+        Size::new(width, height),
+        0.0, 
+        0.0, 
+        imgproc::INTER_CUBIC).unwrap();
+    
+    Ok(centre_surr_diff_dst)
+}
+
+#[allow(dead_code)]
+fn extract_map_features(image_chosen: Mat, combinations: &Vec<(u8, u8)>, height: i32, width: i32) -> Vec<Mat> {
+    let mut final_map_features: Vec<Mat> = Vec::new();
+    let dgp_features = dyalic_gaussian_pyramid(image_chosen).unwrap();
+    for (_, combination) in combinations.iter().enumerate() {
+        let finer_map: &Mat = &dgp_features[combination.0 as usize];
+        let coarser_map: &Mat = &dgp_features[combination.1 as usize];
+
+        let centre_surr_diff = combine_dgp_map(finer_map, 
+            coarser_map, 
+            height, 
+            width).unwrap();
+        final_map_features.push(centre_surr_diff);
+    }
+    final_map_features
+}
+
+#[allow(dead_code)]
+fn calculate_distance(slic_segments: &Mat, 
+                    segment_id: usize, 
+                    image_center_x: usize, 
+                    image_center_y: usize, 
+                    height: i32, width: i32) {
+    
+
+}
+
+#[allow(dead_code)]
 fn array_to_mat<'a> (array: ArrayInput) -> opencv::Result<Mat> {
     match array {
         ArrayInput::TwoDim(arr) => {
@@ -168,13 +261,15 @@ fn array_to_mat<'a> (array: ArrayInput) -> opencv::Result<Mat> {
 pub fn feature_extraction (image_mat: Mat, n_segments: i32, compactness: i32) {
     let height = image_mat.rows();
     let width = image_mat.cols();
+
+    //  #### CONTRAST ENHANCED HISTOGRAM ####
     // Convert BGR to HSV
     let mut hsv_format = Mat::default();
     imgproc::cvt_color(&image_mat,
         &mut hsv_format, 
         imgproc::COLOR_BGR2HSV, 
         0,
-        AlgorithmHint::ALGO_HINT_DEFAULT);
+        AlgorithmHint::ALGO_HINT_DEFAULT).unwrap();
 
     // Split channels 
     let bgr = ImageChannels::split_channel(&image_mat, ImageFormat::BGR).unwrap();
@@ -217,17 +312,84 @@ pub fn feature_extraction (image_mat: Mat, n_segments: i32, compactness: i32) {
 
     // Get the histogram value for each segment
     let blue_hist = segment_hist_calculation(slic_label_mat.clone(),
-                                                            bgr.first_channel.clone()).unwrap();
+                                            bgr.first_channel.clone()).unwrap();
     let green_hist = segment_hist_calculation(slic_label_mat.clone(),
-                                                            bgr.second_channel.clone()).unwrap();
+                                            bgr.second_channel.clone()).unwrap();
     let hue_hist = segment_hist_calculation(slic_label_mat.clone(),
-                                                            hsv.first_channel.clone()).unwrap();
+                                            hsv.first_channel.clone()).unwrap();
     let saturation_hist = segment_hist_calculation(slic_label_mat.clone(),
-                                                            hsv.second_channel.clone()).unwrap();
+                                                    hsv.second_channel.clone()).unwrap();
 
     //  Concatenate the histogram values to get the feature vector the shape should be (n_segments, 256 * 4)
     let ceh_features = concatenate(Axis((1)),
-                                                                             &[blue_hist.view(), green_hist.view(), hue_hist.view(), saturation_hist.view()]).unwrap();
+                                    &[blue_hist.view(), green_hist.view(), hue_hist.view(), saturation_hist.view()]).unwrap();
+
+    //  #### CENTRE SURROUND STATISTICS ####
+    let combinations: Vec<(u8, u8)> = vec![(2, 5), (2, 6), (3, 6), (3, 7), (4, 7), (4, 8)];
+    let mut map_features: Vec<Mat> = extract_map_features(bgr.first_channel.clone(), 
+                                                            &combinations, 
+                                                            height, 
+                                                            width);
+    let map_features_green: Vec<Mat> = extract_map_features(bgr.second_channel.clone(), 
+                                                            &combinations, 
+                                                            height, 
+                                                            width);
+    map_features.extend(map_features_green.into_iter());
+
+    let mut slic_unique_segments = HashMap::new();
+    for row in 0..width {
+        for col in 0..height {
+            let segment_id = slic_label_mat.at_2d::<u8>(row, col).unwrap();
+            *slic_unique_segments.entry(segment_id).or_insert(0) += 1;
+        }
+    }
+    
+    let mut css_features: Vec<Vec<f64>> = Vec::new();
+    for (_, (seg_val, _)) in slic_unique_segments.iter().enumerate() {
+        let mut superpixel_features: Vec<f64> = Vec::new();
+        let mut zero_mask = Mat::zeros(width,
+                                            height,
+                                            CV_8UC1).unwrap().to_mat().unwrap();
+        
+        for row in 0..width {
+            for col in 0..height {
+                let segment_id = slic_label_mat.at_2d::<u8>(row, col).unwrap();
+                if segment_id == *seg_val {
+                    *zero_mask.at_2d_mut::<u8>(row, col).unwrap() = 255;
+                }
+            }
+        }
+
+        for diff_map in map_features.iter() {
+            let mut diff_masked = Mat::default();
+            bitwise_and(diff_map, 
+                diff_map, 
+                &mut diff_masked, 
+                &zero_mask).unwrap();
+            
+            let mut non_zero_value = Mat::default();
+            find_non_zero(&diff_masked, &mut non_zero_value).unwrap();
+            let mut pixel_value: Vec<f64> = Vec::new();
+            for idx in 0..non_zero_value.rows() {
+                let point = non_zero_value.at_2d::<Point>(idx, 0).unwrap();
+                let value = diff_masked.at_2d::<f64>(point.x, point.y).unwrap();
+                pixel_value.push(*value);
+            }
+            
+            let len_pixel_value=  pixel_value.len();
+            let mean_value: f64 = pixel_value.iter().fold(0.0, |acc, &x| acc + x) / len_pixel_value as f64;
+            superpixel_features.push(mean_value);
+            let var_value: f64 = pixel_value.iter().fold(0.0, |acc, &x| {
+                let diff = x - mean_value;
+                acc + diff * diff
+            }) / len_pixel_value as f64;
+            superpixel_features.push(var_value);
+        }
+        css_features.push(superpixel_features);
+        
+
+
+    }
 
 }   
 
