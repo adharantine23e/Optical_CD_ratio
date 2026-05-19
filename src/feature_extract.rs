@@ -32,7 +32,7 @@ struct ImageChannels {
 impl ImageChannels {
     fn split_channel(image_mat: &Mat, image_format: ImageFormat) -> opencv::Result<Self> {
         let mut channels = Vector::<Mat>::new();
-        split(image_mat, &mut channels);
+        split(image_mat, &mut channels).unwrap();
 
         Ok(
             ImageChannels { 
@@ -43,6 +43,13 @@ impl ImageChannels {
                 }
         )
     }
+}
+
+struct NeighborPixel {
+    left: Option<u8>, 
+    right: Option<u8>,
+    up: Option<u8>,
+    down: Option<u8>
 }
 
 #[allow(dead_code)]
@@ -67,7 +74,7 @@ fn calculate_histogram(image_mat: &Mat, mask: &Mat) -> opencv::Result<Mat> {
                          &mut hist, 
                          &hist_size, 
                          &ranges,
-                        false);
+                        false).unwrap();
     Ok(hist)
 }
 
@@ -161,12 +168,12 @@ fn combine_dgp_map(finer_map: &Mat, coaser_map: &Mat, height: i32, width: i32) -
     finer_map.convert_to(&mut finer_map_float,
         CV_64FC1, 
         1.0, 
-        0.0);
+        0.0).unwrap();
     
     coaser_map.convert_to(&mut coarser_map_float,
         CV_64FC1, 
         1.0, 
-        0.0);
+        0.0).unwrap();
     
     // Compute center-surround difference: finer - interpolated coarser
     let mut centre_surr_diff = Mat::default();
@@ -206,12 +213,93 @@ fn extract_map_features(image_chosen: Mat, combinations: &Vec<(u8, u8)>, height:
 
 #[allow(dead_code)]
 fn calculate_distance(slic_segments: &Mat, 
-                    segment_id: usize, 
+                    segment_val: &&u8, 
                     image_center_x: usize, 
                     image_center_y: usize, 
-                    height: i32, width: i32) {
-    
+                    height: i32, width: i32) -> f64 {
+    // Based on the papers, get the distance D(j) between the center of superpixel and the center of the disc as location information
 
+    let mut rows_sum: i64 = 0;
+    let mut cols_sum: i64 = 0;
+    let mut count: i64 = 0;
+
+    for col in 0..width {
+        for row in 0..height {
+            let segment_id = slic_segments.at_2d::<u8>(row, col).unwrap();
+            if segment_id == *segment_val {
+                rows_sum += row as i64;
+                cols_sum += col as i64;
+                count += 1;
+            }
+        }
+    }
+
+    let center_y = rows_sum / count;
+    let center_x = cols_sum / count;
+    let dx = ((image_center_x as i64 - center_x) / height as i64).pow(2) as f64;
+    let dy = ((image_center_y as i64 - center_y) / width as i64).pow(2) as f64;
+    (dx + dy).sqrt()
+
+}
+
+#[allow(dead_code)]
+fn find_neighboring_pixels(slic_segments: &Mat, segment_val: &&u8, height: i32, width: i32) -> NeighborPixel {
+    // Based on the paper, find the 4 neighboring pixels for each superpixel (left, right, up, down)
+    let mut rows_sum: i64 = 0;
+    let mut cols_sum: i64 = 0;
+    let mut count: i32 = 0;
+    for col in 0..width {
+        for row in 0..height {
+            let segment_id = slic_segments.at_2d::<u8>(row, col).unwrap();
+            if segment_id == *segment_val {
+                rows_sum += row as i64;
+                cols_sum += col as i64;
+                count += 1;
+            }
+        }
+    }
+
+    let center_y: i32 = rows_sum as i32 / count;
+    let center_x: i32 = cols_sum as i32 / count;
+    //  Left neightbor pixel
+    let mut left_pixel: Option<u8> = Some(**segment_val);
+    for x in (0..center_x -1).rev() {
+        if slic_segments.at_2d::<u8>(center_y, x).unwrap() != *segment_val {
+            left_pixel = Some(*slic_segments.at_2d::<u8>(center_y, x).unwrap());
+            break;
+        }
+    }
+    // Right neighbor pixel
+    let mut right_pixel: Option<u8> = Some(**segment_val);
+    for x in center_x + 1..width {
+        if slic_segments.at_2d::<u8>(center_y, x).unwrap() != *segment_val {
+            right_pixel = Some(*slic_segments.at_2d::<u8>(center_y, x).unwrap());
+            break;
+        }
+    }
+    // Up neighbor pixel
+    let mut up_pixel: Option<u8> = Some(**segment_val);
+    for y in (0..center_y).rev() {
+        if slic_segments.at_2d::<u8>(y, center_x).unwrap() != *segment_val {
+            up_pixel = Some(*slic_segments.at_2d::<u8>(y, center_x).unwrap());
+            break;
+        }
+    }
+    // Down neighbor pixel
+    let mut down_pixel: Option<u8> = Some(**segment_val);
+    for y in center_y+1..height {
+        if slic_segments.at_2d::<u8>(y, center_x).unwrap() != *segment_val {
+            down_pixel = Some(*slic_segments.at_2d::<u8>(y, center_x).unwrap());
+            break;
+        }
+    }
+
+    NeighborPixel {
+        left: left_pixel,
+        right: right_pixel,
+        up: up_pixel,
+        down: down_pixel
+    }
 }
 
 #[allow(dead_code)]
@@ -281,7 +369,7 @@ pub fn feature_extraction (image_mat: Mat, n_segments: i32, compactness: i32) {
                         &mut rgb_image_mat, 
                         imgproc::COLOR_BGR2RGB, 
                         0, 
-                        AlgorithmHint::ALGO_HINT_DEFAULT);
+                        AlgorithmHint::ALGO_HINT_DEFAULT).unwrap();
     let data_byte: &[u8] = rgb_image_mat.data_bytes().unwrap();
     let lab_image = LABImage::from_srgb(data_byte, 
                                                  width as usize, 
@@ -386,10 +474,9 @@ pub fn feature_extraction (image_mat: Mat, n_segments: i32, compactness: i32) {
             superpixel_features.push(var_value);
         }
         css_features.push(superpixel_features);
-        
-
-
     }
+
+
 
 }   
 

@@ -10,6 +10,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ndarray = "0.17.2"
-opencv = "0.98.2"
+opencv =  "0.98.2"
 pyo3 = "0.28.2"
-
+fast-slic-rust = {git = "https://github.com/ondrasouk/fast-slic-rust" }
