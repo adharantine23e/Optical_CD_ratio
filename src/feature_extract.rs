@@ -1,5 +1,6 @@
 use std::ffi::c_void;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeMap};
+use std::iter::once;
 use std::sync::atomic::{Ordering};
 use ndarray::{concatenate, prelude::*};
 use opencv::core::{CV_16FC1, CV_64FC1, Point, Size_};
@@ -51,6 +52,11 @@ struct NeighborPixel {
     up: Option<u8>,
     down: Option<u8>
 }
+impl NeighborPixel {
+    pub fn as_vec(&self) -> [u8; 4] {
+        [self.left.unwrap(), self.right.unwrap(), self.up.unwrap(), self.down.unwrap()]
+    }
+}
 
 #[allow(dead_code)]
 fn apply_histogram_equalization(image_mat: &Mat) -> opencv::Result<Mat> {
@@ -87,7 +93,7 @@ fn segment_hist_calculation(slic_segments: Mat, image_chosen: Mat) -> Result<Arr
         let rows = slic_segments.rows();
         let cols = slic_segments.cols();
         let mut histogram_value: Vec<Vec<f32>> = Vec::new();
-        let mut slic_unique_segments = HashMap::new();
+        let mut slic_unique_segments = BTreeMap::new();
         for row in 0..rows {
             for col in 0..cols {
                 let segment_id = *slic_segments.at_2d::<u8>(row, col).unwrap();
@@ -243,7 +249,7 @@ fn calculate_distance(slic_segments: &Mat,
 }
 
 #[allow(dead_code)]
-fn find_neighboring_pixels(slic_segments: &Mat, segment_val: &&u8, height: i32, width: i32) -> NeighborPixel {
+fn find_neighboring_pixels(slic_segments: &Mat, segment_val: &u8, height: i32, width: i32) -> NeighborPixel {
     // Based on the paper, find the 4 neighboring pixels for each superpixel (left, right, up, down)
     let mut rows_sum: i64 = 0;
     let mut cols_sum: i64 = 0;
@@ -251,7 +257,7 @@ fn find_neighboring_pixels(slic_segments: &Mat, segment_val: &&u8, height: i32, 
     for col in 0..width {
         for row in 0..height {
             let segment_id = slic_segments.at_2d::<u8>(row, col).unwrap();
-            if segment_id == *segment_val {
+            if segment_id == segment_val {
                 rows_sum += row as i64;
                 cols_sum += col as i64;
                 count += 1;
@@ -262,33 +268,33 @@ fn find_neighboring_pixels(slic_segments: &Mat, segment_val: &&u8, height: i32, 
     let center_y: i32 = rows_sum as i32 / count;
     let center_x: i32 = cols_sum as i32 / count;
     //  Left neightbor pixel
-    let mut left_pixel: Option<u8> = Some(**segment_val);
+    let mut left_pixel: Option<u8> = Some(*segment_val);
     for x in (0..center_x -1).rev() {
-        if slic_segments.at_2d::<u8>(center_y, x).unwrap() != *segment_val {
+        if slic_segments.at_2d::<u8>(center_y, x).unwrap() != segment_val {
             left_pixel = Some(*slic_segments.at_2d::<u8>(center_y, x).unwrap());
             break;
         }
     }
     // Right neighbor pixel
-    let mut right_pixel: Option<u8> = Some(**segment_val);
+    let mut right_pixel: Option<u8> = Some(*segment_val);
     for x in center_x + 1..width {
-        if slic_segments.at_2d::<u8>(center_y, x).unwrap() != *segment_val {
+        if slic_segments.at_2d::<u8>(center_y, x).unwrap() != segment_val {
             right_pixel = Some(*slic_segments.at_2d::<u8>(center_y, x).unwrap());
             break;
         }
     }
     // Up neighbor pixel
-    let mut up_pixel: Option<u8> = Some(**segment_val);
+    let mut up_pixel: Option<u8> = Some(*segment_val);
     for y in (0..center_y).rev() {
-        if slic_segments.at_2d::<u8>(y, center_x).unwrap() != *segment_val {
+        if slic_segments.at_2d::<u8>(y, center_x).unwrap() != segment_val {
             up_pixel = Some(*slic_segments.at_2d::<u8>(y, center_x).unwrap());
             break;
         }
     }
     // Down neighbor pixel
-    let mut down_pixel: Option<u8> = Some(**segment_val);
+    let mut down_pixel: Option<u8> = Some(*segment_val);
     for y in center_y+1..height {
-        if slic_segments.at_2d::<u8>(y, center_x).unwrap() != *segment_val {
+        if slic_segments.at_2d::<u8>(y, center_x).unwrap() != segment_val {
             down_pixel = Some(*slic_segments.at_2d::<u8>(y, center_x).unwrap());
             break;
         }
@@ -300,6 +306,43 @@ fn find_neighboring_pixels(slic_segments: &Mat, segment_val: &&u8, height: i32, 
         up: up_pixel,
         down: down_pixel
     }
+}
+
+#[allow(dead_code)]
+fn expand_css_neighbor(css_feautures: Vec<Vec<f64>>, slic_segments: &Mat) -> Vec<Vec<f64>> {
+    let height = slic_segments.rows();
+    let width = slic_segments.cols();
+    let mut slic_unique_segments = BTreeMap::new();
+    for row in 0..height {
+        for col in 0..width {
+            let segment_id = *slic_segments.at_2d::<u8>(row, col).unwrap();
+            *slic_unique_segments.entry(segment_id).or_insert(0) += 1;
+        }
+    }
+
+    let seg_id_to_idx: HashMap<u8, usize> = slic_unique_segments.iter()
+                            .enumerate()
+                            .map(|(idx, (&segment_id, _))| (segment_id, idx))
+                            .collect();
+
+    let mut expanded_css_features = Vec::new();
+    for (segment_id, (segment_val, _)) in slic_unique_segments.iter().enumerate() {
+        let neighbors = find_neighboring_pixels(slic_segments, 
+                                        segment_val, 
+                                        height, 
+                                        width);
+        let curr_css_feature = css_feautures[segment_id].clone();
+        let mut neighbor_features = Vec::new();
+        for direction_value in neighbors.as_vec() {
+            let neighbor_idx = seg_id_to_idx.get(&direction_value).unwrap();
+            neighbor_features.push(css_feautures[*neighbor_idx].clone());
+        }
+
+        let mut expanded_css = curr_css_feature;
+        expanded_css.extend(neighbor_features.into_iter().flatten());
+        expanded_css_features.push(expanded_css);
+    }
+    expanded_css_features
 }
 
 #[allow(dead_code)]
@@ -409,7 +452,7 @@ pub fn feature_extraction (image_mat: Mat, n_segments: i32, compactness: i32) {
                                                     hsv.second_channel.clone()).unwrap();
 
     //  Concatenate the histogram values to get the feature vector the shape should be (n_segments, 256 * 4)
-    let ceh_features = concatenate(Axis((1)),
+    let ceh_features = concatenate(Axis(1),
                                     &[blue_hist.view(), green_hist.view(), hue_hist.view(), saturation_hist.view()]).unwrap();
 
     //  #### CENTRE SURROUND STATISTICS ####
@@ -424,7 +467,7 @@ pub fn feature_extraction (image_mat: Mat, n_segments: i32, compactness: i32) {
                                                             width);
     map_features.extend(map_features_green.into_iter());
 
-    let mut slic_unique_segments = HashMap::new();
+    let mut slic_unique_segments = BTreeMap::new();
     for row in 0..width {
         for col in 0..height {
             let segment_id = slic_label_mat.at_2d::<u8>(row, col).unwrap();
@@ -476,8 +519,31 @@ pub fn feature_extraction (image_mat: Mat, n_segments: i32, compactness: i32) {
         css_features.push(superpixel_features);
     }
 
-
-
+    let expanded_css_features = expand_css_neighbor(css_features, &slic_label_mat);
+    
+    // Min max Normalize features
+    let ceh_features_normalized = {
+        let sum = ceh_features.map(|x| x.abs())
+                .sum_axis(Axis(1))
+                .insert_axis(Axis(1));
+        &ceh_features / (sum + 1e-10)
+    };
+    let css_min: Vec<f64> = (0..expanded_css_features[0].len()).map(|col| expanded_css_features.iter()
+                                                                                .map(|row| row[col])
+                                                                                .reduce(f64::min)
+                                                                                .unwrap()).collect();      
+    let css_max: Vec<f64> = (0..expanded_css_features[0].len()).map(|col| expanded_css_features.iter()
+                                                                                .map(|row| row[col])
+                                                                                .reduce(f64::max)
+                                                                                .unwrap()).collect(); 
+    let css_features_normalized: Vec<Vec<f64>> = expanded_css_features.iter()
+                                        .map(|row| {
+                                            row.iter()
+                                                .enumerate()
+                                                .map(|(col_idx, val)| (val - css_min[col_idx]) / (css_max[col_idx] - css_min[col_idx] + 1e-10))
+                                                .collect()
+                                        })
+                                        .collect();
 }   
 
 fn main () {
@@ -612,4 +678,31 @@ mod test {
                             &params).unwrap();
 
     }
+
+    #[test]
+    fn test_min_max_float_vec() {
+        let test_vec: Vec<f64> = vec![-12.4, 11.0, 2.0, -2.0, -5.4, 8.5];
+        let min_value = test_vec.iter()
+                                .copied()
+                                .reduce(f64::min)
+                                .unwrap();
+        let max_value = test_vec.iter()
+                                .copied()
+                                .reduce(f64::max)
+                                .unwrap();
+
+        let test_vec_vec: Vec<Vec<f64>> = vec![vec![-12.4, 11.0], vec![2.0, -2.0], vec![-5.4, 8.5]];
+        let min_value_vec: Vec<f64> = (0..test_vec_vec[0].len()).map(|col| test_vec_vec.iter()
+                                                                                .map(|row| row[col])
+                                                                                .reduce(f64::min)
+                                                                                .unwrap()).collect();
+        let max_value_vec: Vec<f64> = (0..test_vec_vec[0].len()).map(|col| test_vec_vec.iter()
+                                                                                .map(|row| row[col])
+                                                                                .reduce(f64::max)
+                                                                                .unwrap()).collect();
+        println!("{:?}", min_value_vec);
+        println!("{:?}", max_value_vec);
+        assert_eq!(min_value, -12.4f64);
+        assert_eq!(max_value, 11.0f64);
+}
 }
